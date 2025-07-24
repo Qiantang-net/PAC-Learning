@@ -1,0 +1,298 @@
+from __future__ import absolute_import, print_function
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temp_param, eps=1e-12, reduce=True):
+        super(ContrastiveLoss, self).__init__()
+        self.temp_param = temp_param
+        self.eps = eps
+        self.reduce = reduce
+
+    def get_score(self, query, key):
+        '''
+        query : (NxL) x C or N x C -> T x C  (initial latent features)
+        key : M x C     (memory items)
+        '''
+        qs = query.size()
+        ks = key.size()
+
+        score = torch.matmul(query, torch.t(key))   # Fea x Mem^T : (TXC) X (CXM) = TxM
+        score = F.softmax(score, dim=1) # TxM
+
+        return score
+    
+    def forward(self, queries, items):
+        '''
+        anchor : query
+        positive : nearest memory item
+        negative(hard) : second nearest memory item
+        queries : N x L x C
+        items : M x C
+        '''
+        batch_size = queries.size(0)
+        d_model = queries.size(-1)
+
+        # margin from 1.0 
+        loss = torch.nn.TripletMarginLoss(margin=1.0, reduce=self.reduce)
+
+        queries = queries.contiguous().view(-1, d_model)    # (NxL) x C >> T x C
+        score = self.get_score(queries, items)      # TxM
+
+        # gather indices of nearest and second nearest item
+        _, indices = torch.topk(score, 2, dim=1)
+
+        # 1st and 2nd nearest items (l2 normalized)
+        pos = items[indices[:, 0]]  # TxC
+        neg = items[indices[:, 1]]  # TxC
+        anc = queries              # TxC
+
+        spread_loss = loss(anc, pos, neg)
+
+        if self.reduce:
+            return spread_loss
+        
+        spread_loss = spread_loss.contiguous().view(batch_size, -1)       # N x L
+        
+        return spread_loss     # N x L
+
+
+
+###用于计算查询与记忆项之间的相似性损失。它通过计算每个查询与其最相似记忆项的均方误差，来衡量查询与记忆之间的聚合性。###
+class GatheringLoss(nn.Module):
+    def __init__(self, reduce=True):
+        super(GatheringLoss, self).__init__()
+        self.reduce = reduce
+
+    def get_score(self, query, key):
+        '''
+        query : (NxL) x C or N x C -> T x C  (initial latent features)
+        key : M x C     (memory items)
+        '''
+        qs = query.size()
+        ks = key.size()
+
+        score = torch.matmul(query, torch.t(key))   # Fea x Mem^T : (TXC) X (CXM) = TxM
+        score = F.softmax(score, dim=1) # TxM
+
+        return score
+    
+    def forward(self, queries, items):
+        '''
+        queries : N x L x C
+        items : M x C
+        '''
+        batch_size = queries.size(0)
+        d_model = queries.size(-1)
+
+        loss_mse = torch.nn.MSELoss(reduce=self.reduce)
+
+        queries = queries.contiguous().view(-1, d_model)    # (NxL) x C >> T x C
+        score = self.get_score(queries, items)      # TxM
+
+        _, indices = torch.topk(score, 1, dim=1)
+
+        gathering_loss = loss_mse(queries, items[indices].squeeze(1))
+
+        if self.reduce:
+            return gathering_loss
+        
+        gathering_loss = torch.sum(gathering_loss, dim=-1)  # T
+        gathering_loss = gathering_loss.contiguous().view(batch_size, -1)   # N x L
+
+        return gathering_loss
+
+
+class EntropyLoss(nn.Module):
+    def __init__(self, eps=1e-12):
+        super(EntropyLoss, self).__init__()
+        self.eps = eps
+    
+    def forward(self, x):
+        '''
+        x (attn_weights) : TxM
+        '''
+        loss = -1 * x * torch.log(x + self.eps)
+        loss = torch.sum(loss, dim=-1)
+        loss = torch.mean(loss)
+        return loss
+
+
+class NearestSim(nn.Module):
+    def __init__(self):
+        super(NearestSim, self).__init__()
+        
+    def get_score(self, query, key):
+        '''
+        query : (NxL) x C or N x C -> T x C  (initial latent features)
+        key : M x C     (memory items)
+        '''
+        qs = query.size()
+        ks = key.size()
+
+        score = F.linear(query, key)   # Fea x Mem^T : (TXC) X (CXM) = TxM
+        score = F.softmax(score, dim=1) # TxM
+
+        return score
+    
+    def forward(self, queries, items):
+        '''
+        anchor : query
+        positive : nearest memory item
+        negative(hard) : second nearest memory item
+        queries : N x L x C
+        items : M x C
+        '''
+        batch_size = queries.size(0)
+        d_model = queries.size(-1)
+
+        queries = queries.contiguous().view(-1, d_model)    # (NxL) x C >> T x C
+        score = self.get_score(queries, items)      # TxM
+
+        # gather indices of nearest and second nearest item
+        _, indices = torch.topk(score, 2, dim=1)
+
+        # 1st and 2nd nearest items (l2 normalized)
+        pos = F.normalize(items[indices[:, 0]], p=2, dim=-1)  # TxC
+        anc = F.normalize(queries, p=2, dim=-1)               # TxC
+
+        similarity = -1 * torch.sum(pos * anc, dim=-1)         # T
+        similarity = similarity.contiguous().view(batch_size, -1)   # N x L
+        
+        return similarity     # N x L
+
+
+class EntropyLossWithRegularization(nn.Module):
+    def __init__(self, eps=1e-12, lambda_reg=1e-4):
+        super(EntropyLossWithRegularization, self).__init__()
+        self.eps = eps
+        self.lambda_reg = lambda_reg
+
+    def forward(self, x):
+        '''
+        x (attn_weights) : TxM
+        '''
+        # 计算熵损失
+        loss = -1 * x * torch.log(x + self.eps)
+        loss = torch.sum(loss, dim=-1)
+        loss = torch.mean(loss)
+
+        # L2 正则化项
+        reg_loss = torch.norm(x, p=2)  # 计算 L2 范数
+        total_loss = loss + self.lambda_reg * reg_loss  # 总损失 = 熵损失 + 正则化损失
+
+        return total_loss
+def instance_contrastive_loss(N_aug, N_Aaug, A_aug, A_Naug):
+    """
+    计算基于实例的对比损失：
+    - N_aug: 锚点，形状为 (B, T, D)
+    - N_Aaug: 正样本，形状为 (B, T, D)
+    - A_aug: 负样本，形状为 (B, T, D)
+    - A_Naug: 负样本，形状为 (B, T, D)
+    """
+    B, T, D = N_aug.size()
+    # 拼接锚点、正样本和负样本
+    z1 = N_aug  # 锚点（anchor）
+    z2 = torch.cat([N_Aaug, A_aug, A_Naug], dim=0)  # 正样本和负样本（positive and negative pairs）
+    # 将拼接后的张量转置：T x 2B x D
+    z = torch.cat([z1, z2], dim=0)  # 2B x T x D
+    z = z.transpose(0, 1)  # T x 2B x D
+    # 计算相似度矩阵 T x 2B x 2B
+    sim = torch.matmul(z, z.transpose(1, 2))  # 计算 z 与其转置的点积，得到相似度矩阵 sim
+    # 对相似度矩阵进行处理，获取下三角和上三角部分
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]  # T x 2B x (2B-1) 下三角
+    logits += torch.triu(sim, diagonal=1)[:, :, 1:]   # T x 2B x (2B-1) 上三角
+    # 对 logits 进行 softmax 操作，并取负对数概率值
+    logits = -F.log_softmax(logits, dim=-1)
+    # 计算对比损失
+    i = torch.arange(B, device=z1.device)  # 生成 [0, 1, 2, ..., B-1] 索引
+    # 锚点与正样本之间的损失
+    positive_loss = logits[:, i, B + i - 1].mean()
+    # 锚点与负样本之间的损失
+    negative_loss = logits[:, B + i, i].mean()
+    # 返回正样本和负样本的平均损失
+    loss = (positive_loss + negative_loss) / 2
+    return loss
+
+
+
+# def temporal_contrastive_loss(z1, z2):
+#     B, T = z1.size(0), z1.size(1)
+#     if T == 1:
+#         return z1.new_tensor(0.)
+#     z = torch.cat([z1, z2], dim=1)  # B x 2T x C
+#     sim = torch.matmul(z, z.transpose(1, 2))  # B x 2T x 2T  ##表示时间点之间的相似度
+#     logits = torch.tril(sim, diagonal=-1)[:, :, :-1]  # B x 2T x (2T-1)
+#     ##diagonal 参数指定了要归零的对角线上方的元素。通过设置 diagonal=-1，它确保对角线及其上方的元素被归零，只留下下三角部分。
+#     # [:, :, :-1]: 这是切片符号，用于从张量中选择子集。在这里，: 用于选择第一和第二维度上的所有元素，
+#     # :-1 用于选择沿着第三维度的所有元素，但不包括最后一个。
+#     logits += torch.triu(sim, diagonal=1)[:, :, 1:]
+#     # 计算上三角部分 用于选择沿着第三维度的所有元素，但不包括第一个元素
+#     logits = -F.log_softmax(logits, dim=-1)
+#
+#     t = torch.arange(T, device=z1.device)
+#     loss = (logits[:, t, T + t - 1].mean() + logits[:, T + t, t].mean()) / 2
+#     return loss
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+
+def temporal_contrastive_loss(z1, z2, temperature=0.07):
+    """
+    计算时间对比损失，正样本是相邻时间点，负样本是z1与z2的所有时间点的相似度。
+
+    参数:
+    - z1: Tensor of shape (B, T, D), 输入的特征表示 z1
+    - z2: Tensor of shape (B, T, D), 输入的特征表示 z2
+    - temperature: 温度参数，用于控制相似度的平滑性
+
+    返回:
+    - loss: 计算得到的对比损失
+    """
+    B, T, D = z1.shape
+
+    # 计算相似度（使用点积）
+    sim_1 = torch.matmul(z1, z1.transpose(1, 2))  # B x T x T, z1 vs z1
+    sim_2 = torch.matmul(z1, z2.transpose(1, 2))  # B x T x T, z1 vs z2
+
+    # 正样本：相邻时间步（t 和 t+1，t 和 t-1）
+    positive_sim_1 = torch.diagonal(sim_1, offset=1, dim1=1, dim2=2)  # 形状 (B, T-1), 时间 t 和 t+1
+    positive_sim_2 = torch.diagonal(sim_1, offset=-1, dim1=1, dim2=2)  # 形状 (B, T-1), 时间 t 和 t-1
+
+    # 拼接正样本
+    positive_sim = torch.cat([positive_sim_1, positive_sim_2], dim=-1)  # (B, 2*(T-1))
+
+    # 负样本：所有时间步的相似度（z1[t] 与 z2 的所有时间步进行比较）
+    negative_sim = sim_2.view(B, -1)  # 变形为 (B, T*T)，每个时间步与所有 z2 时间步的相似度
+    negative_sim = negative_sim[:, :2 * (T - 1)]  # 截取负样本，使其与正样本的数量一致
+
+    # **L2 范数归一化**
+    positive_sim_norm = F.normalize(positive_sim, p=2, dim=-1)  # L2 范数归一化
+    negative_sim_norm = F.normalize(negative_sim, p=2, dim=-1)  # L2 范数归一化
+
+    # **Softmax 归一化**
+    # positive_sim = F.softmax(positive_sim / temperature, dim=-1)
+    # negative_sim = F.softmax(negative_sim / temperature, dim=-1)
+
+    # 计算正负样本的对比损失（使用softmax和温度参数）
+    positive_sim_norm = positive_sim_norm / temperature  # 温度缩放
+    negative_sim_norm = negative_sim_norm / temperature  # 温度缩放
+
+    # 拼接正负样本，形状为 (B, 2*(T-1))，然后展平成一维
+    logits = torch.cat([positive_sim_norm, negative_sim_norm], dim=-1)  # 拼接正负样本
+    logits = logits.view(-1)  # 展平为一维
+
+    # 构建标签，正样本标签为0，负样本标签为1
+    labels = torch.zeros_like(logits, dtype=torch.float).to(z1.device)  # 所有的正样本的标签为0
+
+    # 使用交叉熵损失计算对比损失
+    logits = logits.float()  # 确保 logits 是浮动类型
+    loss = F.cross_entropy(logits, labels)  # 使用交叉熵损失
+
+    return loss
+

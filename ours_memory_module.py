@@ -1,0 +1,587 @@
+from __future__ import absolute_import, print_function
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from sklearn.cluster import KMeans
+
+import math
+class MemoryModule(nn.Module):
+    def __init__(self, n_memory, fea_dim, shrink_thres=0.0025, device=None, memory_init_embedding=None, phase_type=None, dataset_name=None):
+        super(MemoryModule, self).__init__()
+        self.n_memory = n_memory
+        self.fea_dim = fea_dim  # C(=d_model)
+        self.shrink_thres = shrink_thres
+        self.device = device
+        self.phase_type = phase_type
+        self.memory_init_embedding = memory_init_embedding
+        
+        self.U = nn.Linear(fea_dim, fea_dim)
+        self.W = nn.Linear(fea_dim, fea_dim)
+        
+        # mem (memory items) : M x C
+        # first train -> memory_initial : False / memory_init_embedding : None
+        # second_train -> memory_initial : False / memory_init_embedding : kmeans item
+        # test -> memory_initial: False / memory_init_embedding : vectors from second train phase
+        if self.memory_init_embedding == None:
+            if self.phase_type =='test':
+                # test
+                # before
+                # self.memory_init_embedding = torch.load('./memory_item/SMD_memory_item.pth')
+                # print('loading memory item vectors trained from kmeans (for test phase)')
+                # self.mem = self.memory_init_embedding
+                # after
+                load_path = f'/home/stu2023/qtt/project/MEMTO-main/memory_item/{dataset_name}_memory_item.pth'
+                # load_path = f'/home/stu2023/sky/MEMTO-main/memory_item/{dataset_name}_memory_item.pth'
+                ##############################
+                self.mem = torch.load(load_path)
+                print(load_path)
+                print('loading memory item vectors trained from kmeans (for test phase)')
+
+            else:
+                # first train
+                print('loading memory item with random initilzation (for first train phase)')
+
+                self.mem = F.normalize(torch.rand((self.n_memory, self.fea_dim), dtype=torch.float), dim=1)
+        else:
+            # second train 
+            if self.phase_type == 'second_train':
+                print('second training (for second train phase)')
+                # before
+                # self.memory_init_embedding = memory_init_embedding
+                # self.mem = self.memory_init_embedding
+                # after
+                self.mem = memory_init_embedding
+            
+    # relu based hard shrinkage function, only works for positive values
+    def hard_shrink_relu(self, input, lambd=0.0025, epsilon=1e-12):
+        output = (F.relu(input - lambd) * input) / (torch.abs(input - lambd) + epsilon)
+        
+        return output
+    
+    def get_attn_score(self, query, key):
+        '''
+        Calculating attention score with sparsity regularization
+        query (initial features) : (NxL) x C or N x C -> T x C
+        key (memory items): M x C
+        '''
+        attn = torch.matmul(query, torch.t(key.cuda()))    # (TxC) x (CxM) -> TxM
+        attn = F.softmax(attn, dim=-1)
+
+        if (self.shrink_thres > 0):
+            attn = self.hard_shrink_relu(attn, self.shrink_thres)
+            # re-normalize
+            attn = F.normalize(attn, p=1, dim=1)
+        
+        return attn
+    
+    def read(self, query):
+        '''
+        query (initial features) : (NxL) x C or N x C -> T x C
+        read memory items and get new robust features, 
+        while memory items(cluster centers) being fixed 
+        '''
+        self.mem = self.mem.cuda()
+        attn = self.get_attn_score(query, self.mem.detach())  # T x M
+        add_memory = torch.matmul(attn, self.mem.detach())    # T x C
+
+        # add_memory = F.normalize(add_memory, dim=1)
+        read_query = torch.cat((query, add_memory), dim=1)  # T x 2C
+
+        return {'output': read_query, 'attn': attn}
+
+    def update(self, query):
+        '''
+        Update memory items(cluster centers)
+        Fix Encoder parameters (detach)
+        query (encoder output features) : (NxL) x C or N x C -> T x C
+        '''
+        self.mem = self.mem.cuda()
+        attn = self.get_attn_score(self.mem, query.detach())  # M x T
+        add_mem = torch.matmul(attn, query.detach())   # M x C
+
+        # update gate : M x C
+        update_gate = torch.sigmoid(self.U(self.mem) + self.W(add_mem))  # M x C
+        iterm = (1 - update_gate) * self.mem + update_gate * add_mem
+        self.mem = iterm.detach()
+        # self.mem = F.noramlize(self.mem + add_mem, dim=1)   # M x C
+
+    def forward(self, query):
+        '''
+        query (encoder output features) : N x L x C or N x C
+        '''
+        s = query.data.shape
+        l = len(s)
+
+        query = query.contiguous()
+        query = query.view(-1, s[-1])  # N x L x C or N x C -> T x C
+
+        # Normalized encoder output features
+        # query = F.normalize(query, dim=1)
+        
+        # update memory items(cluster centers), while encoder parameters being fixed
+        if self.phase_type != 'test':
+            self.update(query)
+        
+        # get new robust features, while memory items(cluster centers) being fixed
+        outs = self.read(query)
+        
+        read_query, attn = outs['output'], outs['attn']
+        
+        if l == 2:
+            pass
+        elif l == 3:
+            read_query = read_query.view(s[0], s[1], 2*s[2])
+            attn = attn.view(s[0], s[1], self.n_memory)
+        else:
+            raise TypeError('Wrong input dimension')
+        '''
+        output : N x L x 2C or N x 2C
+        attn : N x L x M or N x M
+        '''
+        return {'output': read_query, 'attn': attn, 'memory_init_embedding': self.mem}
+
+
+class AMemoryModule(nn.Module):
+    def __init__(self, a_memory, fea_dim, shrink_thres=0.0025, device=None, memory_init_embedding_a=None, phase_type=None,
+                 dataset_name=None):
+        super(AMemoryModule, self).__init__()
+        self.a_memory = a_memory
+        self.fea_dim = fea_dim  # C(=d_model)
+        self.shrink_thres = shrink_thres
+        self.device = device
+        self.phase_type = phase_type
+        self.memory_init_embedding_a = memory_init_embedding_a
+
+        self.U = nn.Linear(fea_dim, fea_dim)
+        self.W = nn.Linear(fea_dim, fea_dim)
+
+        # mem (memory items) : M x C
+        # first train -> memory_initial : False / memory_init_embedding : None
+        # second_train -> memory_initial : False / memory_init_embedding : kmeans item
+        # test -> memory_initial: False / memory_init_embedding : vectors from second train phase
+        if self.memory_init_embedding_a == None:
+            if self.phase_type == 'test':
+                # test
+                # before
+                # self.memory_init_embedding = torch.load('./memory_item/SMD_memory_item.pth')
+                # print('loading memory item vectors trained from kmeans (for test phase)')
+                # self.mem = self.memory_init_embedding
+                # after
+                load_path_a = f'/home/stu2023/qtt/project/MEMTO-main/amemory_item/{dataset_name}_amemory_item.pth'
+                #load_path_a = f'/home/stu2023/sky/MEMTO-mywork/memory_item/{dataset_name}_memory_item_0.pth'##############################
+                #self.mem = torch.load(load_path)
+                self.mem_a = torch.load(load_path_a)
+
+                print(load_path_a)
+                print('loading memory item vectors trained from kmeans (for test phase)')
+
+            else:
+                # first train
+                print('loading memory item with random initilzation (for first train phase)')
+
+                self.mem_a = F.normalize(torch.rand((self.a_memory, self.fea_dim), dtype=torch.float), dim=1)
+        else:
+            # second train
+            if self.phase_type == 'second_train':
+                print('second training (for second train phase)')
+                # before
+                # self.memory_init_embedding = memory_init_embedding
+                # self.mem = self.memory_init_embedding
+                # after
+                self.mem_a = memory_init_embedding_a
+
+    # relu based hard shrinkage function, only works for positive values
+    def hard_shrink_relu(self, input, lambd=0.0025, epsilon=1e-12):
+        output = (F.relu(input - lambd) * input) / (torch.abs(input - lambd) + epsilon)
+
+        return output
+
+    def get_attn_score(self, query, key):
+        '''
+        Calculating attention score with sparsity regularization
+        query (initial features) : (NxL) x C or N x C -> T x C
+        key (memory items): M x C
+        '''
+        attn = torch.matmul(query, torch.t(key.cuda()))  # (TxC) x (CxM) -> TxM
+        attn = F.softmax(attn, dim=-1)
+
+        if (self.shrink_thres > 0):
+            attn = self.hard_shrink_relu(attn, self.shrink_thres)
+            # re-normalize
+            attn = F.normalize(attn, p=1, dim=1)
+
+        return attn
+
+    def read(self, query):
+        '''
+        query (initial features) : (NxL) x C or N x C -> T x C
+        read memory items and get new robust features,
+        while memory items(cluster centers) being fixed
+        '''
+        self.mem_a = self.mem_a.cuda()
+        attn = self.get_attn_score(query, self.mem_a.detach())  # T x M
+        add_memory = torch.matmul(attn, self.mem_a.detach())  # T x C
+
+        # add_memory = F.normalize(add_memory, dim=1)
+        read_query = torch.cat((query, add_memory), dim=1)  # T x 2C
+
+        return {'output_a': read_query, 'attn_a': attn}
+
+    def update(self, query):
+        '''
+        Update memory items(cluster centers)
+        Fix Encoder parameters (detach)
+        query (encoder output features) : (NxL) x C or N x C -> T x C
+        '''
+        self.mem_a = self.mem_a.cuda()
+        attn = self.get_attn_score(self.mem_a, query.detach())  # M x T
+        add_mem = torch.matmul(attn, query.detach())  # M x C
+
+        # update gate : M x C
+        update_gate = torch.sigmoid(self.U(self.mem_a) + self.W(add_mem))  # M x C
+        iterm = (1 - update_gate) * self.mem_a + update_gate * add_mem
+        self.mem_a = iterm.detach()
+        # self.mem = F.noramlize(self.mem + add_mem, dim=1)   # M x C
+
+    def forward(self, query):
+        '''
+        query (encoder output features) : N x L x C or N x C
+        '''
+        s = query.data.shape
+        l = len(s)
+
+        query = query.contiguous()
+        query = query.view(-1, s[-1])  # N x L x C or N x C -> T x C
+
+        # Normalized encoder output features
+        # query = F.normalize(query, dim=1)
+
+        # update memory items(cluster centers), while encoder parameters being fixed
+        if self.phase_type != 'test':
+            self.update(query)
+
+        # get new robust features, while memory items(cluster centers) being fixed
+        outs = self.read(query)
+
+        read_query, attn = outs['output_a'], outs['attn_a']
+
+        if l == 2:
+            pass
+        elif l == 3:
+            read_query = read_query.view(s[0], s[1], 2 * s[2])
+            attn = attn.view(s[0], s[1], self.a_memory)
+        else:
+            raise TypeError('Wrong input dimension')
+        '''
+        output : N x L x 2C or N x 2C
+        attn : N x L x M or N x M
+        '''
+        return {'output_a': read_query, 'attn_a': attn, 'memory_init_embedding_a': self.mem_a}
+
+
+
+# class ANMemoryModule(nn.Module):
+#     def __init__(self, n_memory, fea_dim, shrink_thres=0.0025, device=None, memory_init_embedding_a=None, phase_type=None,
+#                  dataset_name=None):
+#         super(ANMemoryModule, self).__init__()
+#         self.n_memory = n_memory
+#         self.fea_dim = fea_dim  # C(=d_model)
+#         self.shrink_thres = shrink_thres
+#         self.device = device
+#         self.phase_type = phase_type
+#         self.memory_init_embedding_a = memory_init_embedding_a
+#
+#         self.U = nn.Linear(fea_dim, fea_dim)
+#         self.W = nn.Linear(fea_dim, fea_dim)
+#
+#         # mem (memory items) : M x C
+#         # first train -> memory_initial : False / memory_init_embedding : None
+#         # second_train -> memory_initial : False / memory_init_embedding : kmeans item
+#         # test -> memory_initial: False / memory_init_embedding : vectors from second train phase
+#         if self.memory_init_embedding_a == None:
+#             if self.phase_type == 'test':
+#                 # test
+#                 # before
+#                 # self.memory_init_embedding = torch.load('./memory_item/SMD_memory_item.pth')
+#                 # print('loading memory item vectors trained from kmeans (for test phase)')
+#                 # self.mem = self.memory_init_embedding
+#                 # after
+#                 load_path = f'/home/stu2023/qtt/project/MEMTO-main/memory_item/{dataset_name}_memory_item.pth'  ##############################
+#                 self.mem_a = torch.load(load_path)
+#                 print(load_path)
+#                 print('loading memory item vectors trained from kmeans (for test phase)')
+#
+#             else:
+#                 # first train
+#                 print('loading memory item with random initilzation (for first train phase)')
+#
+#                 self.mem_a = F.normalize(torch.rand((self.n_memory, self.fea_dim), dtype=torch.float), dim=1)
+#         else:
+#             # second train
+#             if self.phase_type == 'second_train':
+#                 print('second training (for second train phase)')
+#                 # before
+#                 # self.memory_init_embedding = memory_init_embedding
+#                 # self.mem = self.memory_init_embedding
+#                 # after
+#                 self.mem_a = memory_init_embedding_a
+#
+#         # relu based hard shrinkage function, only works for positive values
+#
+#     def hard_shrink_relu(self, input, lambd=0.0025, epsilon=1e-12):
+#         output = (F.relu(input - lambd) * input) / (torch.abs(input - lambd) + epsilon)
+#
+#         return output
+#
+#     def get_attn_score(self, query, key):
+#         '''
+#         Calculating attention score with sparsity regularization
+#         query (initial features) : (NxL) x C or N x C -> T x C
+#         key (memory items): M x C
+#         '''
+#         #attn = torch.matmul(query, torch.t(key.cuda()))
+#         attn = torch.matmul(query, key.transpose(-1, -2).cuda())# (TxC) x (CxM) -> TxM
+#         attn = F.softmax(attn, dim=-1)
+#
+#         if (self.shrink_thres > 0):
+#             attn = self.hard_shrink_relu(attn, self.shrink_thres)
+#             # re-normalize
+#             attn = F.normalize(attn, p=1, dim=1)
+#
+#         return attn
+#
+#     def read(self, query, query_a):
+#         '''
+#         query (initial features) : (NxL) x C or N x C -> T x C
+#         read memory items and get new robust features,
+#         while memory items(cluster centers) being fixed
+#         '''
+#         self.mem_a = self.mem_a.cuda()
+#         attn_a = self.get_attn_score(query_a, self.mem_a.detach())  # T x M
+#         add_memory_a = torch.matmul(attn_a, self.mem_a.detach())  # T x C
+#
+#         #add_memory_a = add_memory_a.mean(dim=0)
+#         # add_memory = F.normalize(add_memory, dim=1)
+#         read_query_a = torch.cat((query_a, add_memory_a), dim=1)  # T x 2C
+#
+#         return {'output_a': read_query_a, 'attn_a': attn_a}
+#
+#     def update(self, query, query_a):
+#         '''
+#         Update memory items(cluster centers)
+#         Fix Encoder parameters (detach)
+#         query (encoder output features) : (NxL) x C or N x C -> T x C
+#         '''
+#         self.mem_a = self.mem_a.cuda()
+#         attn_a = self.get_attn_score(self.mem_a, query_a.detach())  # M x T
+#         attn_an = self.get_attn_score(self.mem_a, query.detach())  # M x T
+#
+#
+#         add_mem_a = torch.matmul(attn_a, query_a.detach())  # M x C
+#         add_mem_an = torch.matmul(attn_an, query.detach())  # M x C
+#
+#
+#         # update gate : M x C
+#         update_gate_a = torch.sigmoid(self.U(self.mem_a) + self.W(add_mem_a))  # M x C
+#         update_gate_an = torch.sigmoid(self.U(self.mem_a) + self.W(add_mem_an))  # M x C
+#
+#         iterm = (1 - update_gate_a) * self.mem_a + update_gate_a * add_mem_a - update_gate_an * add_mem_an
+#         self.mem_a = iterm.detach()
+#         # self.mem = F.noramlize(self.mem + add_mem, dim=1)   # M x C
+#
+#         return {'attn_an': attn_an}
+#
+#     def forward(self, query, query_a):
+#         '''
+#         query (encoder output features) : N x L x C or N x C
+#         '''
+#         s = query_a.data.shape
+#         l = len(s)
+#
+#         query = query.contiguous()
+#         query = query.view(-1, s[-1])
+#         query_a = query_a.contiguous()
+#         query_a = query_a.view(-1, s[-1])  # N x L x C or N x C -> T x C
+#
+#         # Normalized encoder output features
+#         # query = F.normalize(query, dim=1)
+#
+#         # update memory items(cluster centers), while encoder parameters being fixed
+#         #if self.phase_type != 'test':
+#         out = self.update(query, query_a)
+#         attn_an = out['attn_an']
+#         # get new robust features, while memory items(cluster centers) being fixed
+#         outs = self.read(query, query_a)
+#
+#         read_query_a, attn_a = outs['output_a'], outs['attn_a']
+#
+#         if l == 2:
+#             pass
+#         elif l == 3:
+#             read_query_a = read_query_a.view(s[0], s[1], 2 * s[2])
+#             attn_a = attn_a.view(s[0], s[1], self.n_memory)
+#             attn_an = attn_an.view(s[0], s[1], self.n_memory)
+#         else:
+#             raise TypeError('Wrong input dimension')
+#         '''
+#         output : N x L x 2C or N x 2C
+#         attn : N x L x M or N x M
+#         '''
+#
+#         return {'output_a': read_query_a, 'attn_a': attn_a, 'memory_init_embedding_a': self.mem_a, 'attn_an': attn_an}
+
+
+class Memory_Unit(nn.Module):
+    def __init__(self, nums, dim, device):
+        super().__init__()
+        self.dim = dim
+        self.nums = nums
+        self.sig = nn.Sigmoid()
+        self.device = device
+
+    def forward(self, data, memory_block):
+        data = data.to(self.device)
+        memory_block = memory_block.to(self.device)
+
+        # 计算注意力分数
+        attention = self.sig(torch.einsum('btd,kd->btk', data, memory_block) / (self.dim ** 0.5))  # B,T,K
+
+        # 获取最重要的时间步，并计算时间注意力
+        temporal_att = torch.topk(attention, self.nums // 16 + 1, dim=-1)[0].mean(-1)  # 计算时间注意力
+
+        # 使用加权的内存块生成增强特征
+        augment = torch.einsum('btk,kd->btd', attention, memory_block)  # feature_aug B,T,D
+
+        # 进行时序特征提取
+        augment = self.temporal_feature_extraction(augment)
+
+        return attention, augment
+
+    def temporal_feature_extraction(self, x):  # 假设 x 的形状为 B, T, D
+        # 确保卷积层在同一个设备上
+        conv = nn.Conv1d(in_channels=x.size(-1), out_channels=x.size(-1), kernel_size=3, padding=1).to(self.device)
+
+        # 转换形状以适应卷积层的输入
+        x = x.transpose(1, 2)  # B, T, D -> B, D, T
+        x = conv(x)  # 应用卷积
+        x = x.transpose(1, 2)  # B, D, T -> B, T, D
+        return x
+
+
+class FrequencyDomainMemoryModule(nn.Module):
+    def __init__(self, n_memory, fea_dim, shrink_thres=0.0025, device=None, memory_init_embedding=None,
+                 phase_type=None):
+        super(FrequencyDomainMemoryModule, self).__init__()
+        self.n_memory = n_memory
+        self.fea_dim = fea_dim  # C(=d_model)
+        self.shrink_thres = shrink_thres
+        self.device = device
+        self.phase_type = phase_type
+        self.memory_init_embedding = memory_init_embedding
+
+        # Linear layers for attention-based operations
+        self.U_real = nn.Linear(fea_dim, fea_dim)
+        self.W_real = nn.Linear(fea_dim, fea_dim)
+        self.U_imag = nn.Linear(fea_dim, fea_dim)
+        self.W_imag = nn.Linear(fea_dim, fea_dim)
+
+        # Memory initialization (for both real and imaginary parts)
+        if self.memory_init_embedding is None:
+            if self.phase_type == 'test':
+                # Load pre-trained memory items if it's the test phase
+                print('Loading pre-trained memory items for test phase')
+                self.mem_real = torch.load('./memory_item/real_memory_item.pth')
+                self.mem_imag = torch.load('./memory_item/imag_memory_item.pth')
+            else:
+                # Random initialization for first training phase
+                print('Randomly initializing memory items for first train phase')
+                self.mem_real = F.normalize(torch.rand((self.n_memory, self.fea_dim), dtype=torch.float), dim=1)
+                self.mem_imag = F.normalize(torch.rand((self.n_memory, self.fea_dim), dtype=torch.float), dim=1)
+        else:
+            # Use provided embeddings for second training phase
+            print('Using provided memory items for second train phase')
+            self.mem_real = self.memory_init_embedding[0]
+            self.mem_imag = self.memory_init_embedding[1]
+
+    def hard_shrink_relu(self, input, lambd=0.0025, epsilon=1e-12):
+        """Relu-based hard shrinkage function."""
+        output = (F.relu(input - lambd) * input) / (torch.abs(input - lambd) + epsilon)
+        return output
+
+    def get_attn_score(self, query, key_real, key_imag):
+        """
+        Calculating attention score with sparsity regularization.
+        query: NxC or TxC
+        key_real, key_imag: M x C (real and imaginary part memories)
+        """
+        attn_real = torch.matmul(query, torch.t(key_real.cuda()))  # (TxC) x (CxM) -> T x M
+        attn_imag = torch.matmul(query, torch.t(key_imag.cuda()))  # (TxC) x (CxM) -> T x M
+        attn = attn_real + attn_imag  # Combine real and imaginary attention scores
+        attn = F.softmax(attn, dim=-1)
+
+        if self.shrink_thres > 0:
+            attn = self.hard_shrink_relu(attn, self.shrink_thres)
+            # Re-normalize attention scores
+            attn = F.normalize(attn, p=1, dim=1)
+
+        return attn
+
+    def read(self, query):
+        """Read from memory to get augmented features."""
+        self.mem_real = self.mem_real.cuda()
+        self.mem_imag = self.mem_imag.cuda()
+
+        attn = self.get_attn_score(query, self.mem_real.detach(), self.mem_imag.detach())  # T x M
+        add_memory_real = torch.matmul(attn, self.mem_real.detach())  # T x C
+        add_memory_imag = torch.matmul(attn, self.mem_imag.detach())  # T x C
+
+        # Concatenate real and imaginary parts of the features
+        read_query = torch.cat((query, add_memory_real, add_memory_imag), dim=1)  # T x 3C
+
+        return {'output': read_query, 'attn': attn}
+
+    def update(self, query):
+        """Update memory items with attention-based mechanism."""
+        self.mem_real = self.mem_real.cuda()
+        self.mem_imag = self.mem_imag.cuda()
+
+        attn_real = self.get_attn_score(self.mem_real, query.detach(), query.detach())  # M x T
+        attn_imag = self.get_attn_score(self.mem_imag, query.detach(), query.detach())  # M x T
+
+        add_mem_real = torch.matmul(attn_real, query.detach())  # M x C
+        add_mem_imag = torch.matmul(attn_imag, query.detach())  # M x C
+
+        # Update gate for real and imaginary parts
+        update_gate_real = torch.sigmoid(self.U_real(self.mem_real) + self.W_real(add_mem_real))  # M x C
+        update_gate_imag = torch.sigmoid(self.U_imag(self.mem_imag) + self.W_imag(add_mem_imag))  # M x C
+
+        # Update memory items
+        self.mem_real = (1 - update_gate_real) * self.mem_real + update_gate_real * add_mem_real
+        self.mem_imag = (1 - update_gate_imag) * self.mem_imag + update_gate_imag * add_mem_imag
+
+    def forward(self, query):
+        """Forward pass for frequency domain memory encoder."""
+        s = query.data.shape
+        l = len(s)
+
+        query = query.contiguous()
+        query = query.view(-1, s[-1])  # Flattening query to (T x C)
+
+        # Update memory items if not in test phase
+        if self.phase_type != 'test':
+            self.update(query)
+
+        # Read from memory and get augmented features
+        outs = self.read(query)
+
+        read_query, attn = outs['output'], outs['attn']
+
+        if l == 2:
+            pass
+        elif l == 3:
+            read_query = read_query.view(s[0], s[1], 3 * s[2])
+            attn = attn.view(s[0], s[1], self.n_memory)
+        else:
+            raise TypeError('Wrong input dimension')
+
+        return {'output': read_query, 'attn': attn, 'memory_init_embedding': (self.mem_real, self.mem_imag)}
